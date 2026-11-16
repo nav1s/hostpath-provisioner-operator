@@ -22,12 +22,14 @@ import (
 	"crypto/tls"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 
 	ocpconfigv1 "github.com/openshift/api/config/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+	hppv1 "kubevirt.io/hostpath-provisioner-operator/pkg/apis/hostpathprovisioner/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -51,9 +53,9 @@ type ManagedTLSWatcher struct {
 
 // NewManagedTLSWatcher creates a new ManagedTLSWatcher with Intermediate profile defaults.
 func NewManagedTLSWatcher() *ManagedTLSWatcher {
-	defaultProfile := &ocpconfigv1.TLSSecurityProfile{
-		Type:         ocpconfigv1.TLSProfileIntermediateType,
-		Intermediate: &ocpconfigv1.IntermediateTLSProfile{},
+	defaultProfile := &hppv1.TLSSecurityProfile{
+		Type:         hppv1.TLSProfileIntermediateType,
+		Intermediate: &hppv1.IntermediateTLSProfile{},
 	}
 	cipherNames, minVersion := selectCipherSuitesAndMinTLSVersion(defaultProfile)
 	return &ManagedTLSWatcher{
@@ -99,9 +101,9 @@ func (m *ManagedTLSWatcher) NeedLeaderElection() bool {
 	return false
 }
 
-// GetTLSConfig returns the current TLS configuration. Override env vars take
+// getTLSConfig returns the current TLS configuration. Override env vars take
 // precedence, then the APIServer CR from cache, then the default Intermediate profile.
-func (m *ManagedTLSWatcher) GetTLSConfig(ctx context.Context) *cryptoConfig {
+func (m *ManagedTLSWatcher) getTLSConfig(ctx context.Context) *cryptoConfig {
 	// Override env vars always take precedence
 	ciphersOverride := os.Getenv("TLS_CIPHERS_OVERRIDE")
 	versionOverride := os.Getenv("TLS_MIN_VERSION_OVERRIDE")
@@ -130,7 +132,29 @@ func (m *ManagedTLSWatcher) GetTLSConfig(ctx context.Context) *cryptoConfig {
 		return m.defaultConfig
 	}
 
-	return cryptoConfigFromProfile(apiServer.Spec.TLSSecurityProfile)
+	return cryptoConfigFromProfile(convertProfileFromOpenshift(apiServer.Spec.TLSSecurityProfile))
+}
+
+func convertProfileFromOpenshift(in *ocpconfigv1.TLSSecurityProfile) *hppv1.TLSSecurityProfile {
+	if in == nil {
+		return nil
+	}
+	out := &hppv1.TLSSecurityProfile{
+		Type:         hppv1.TLSProfileType(in.Type),
+		Old:          (*hppv1.OldTLSProfile)(in.Old),
+		Intermediate: (*hppv1.IntermediateTLSProfile)(in.Intermediate),
+		Modern:       (*hppv1.ModernTLSProfile)(in.Modern),
+	}
+	if in.Custom == nil {
+		return out
+	}
+	out.Custom = &hppv1.CustomTLSProfile{
+		TLSProfileSpec: hppv1.TLSProfileSpec{
+			Ciphers:       slices.Clone(in.Custom.Ciphers),
+			MinTLSVersion: hppv1.TLSProtocolVersion(in.Custom.MinTLSVersion),
+		},
+	}
+	return out
 }
 
 // CryptoPolicyOpt returns a TLS config mutator that dynamically applies
@@ -142,7 +166,7 @@ func (m *ManagedTLSWatcher) CryptoPolicyOpt() func(*tls.Config) {
 		c.NextProtos = []string{"http/1.1"}
 		c.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 			config := c.Clone()
-			cc := m.GetTLSConfig(hello.Context())
+			cc := m.getTLSConfig(hello.Context())
 			config.CipherSuites = cc.CipherSuites
 			config.MinVersion = cc.MinVersion
 			return config, nil
@@ -150,7 +174,7 @@ func (m *ManagedTLSWatcher) CryptoPolicyOpt() func(*tls.Config) {
 	}
 }
 
-func cryptoConfigFromProfile(profile *ocpconfigv1.TLSSecurityProfile) *cryptoConfig {
+func cryptoConfigFromProfile(profile *hppv1.TLSSecurityProfile) *cryptoConfig {
 	cipherNames, minVersion := selectCipherSuitesAndMinTLSVersion(profile)
 	return &cryptoConfig{
 		CipherSuites: cipherSuitesIDs(cipherNames),
@@ -195,7 +219,7 @@ func GetTLSMinVersionString(reader client.Reader) string {
 		return "VersionTLS13"
 	}
 
-	_, minVersion := selectCipherSuitesAndMinTLSVersion(apiServer.Spec.TLSSecurityProfile)
+	_, minVersion := selectCipherSuitesAndMinTLSVersion(convertProfileFromOpenshift(apiServer.Spec.TLSSecurityProfile))
 	return string(minVersion)
 }
 
@@ -240,11 +264,11 @@ func cipherSuitesIDs(names []string) []uint16 {
 	return ids
 }
 
-func selectCipherSuitesAndMinTLSVersion(profile *ocpconfigv1.TLSSecurityProfile) ([]string, ocpconfigv1.TLSProtocolVersion) {
+func selectCipherSuitesAndMinTLSVersion(profile *hppv1.TLSSecurityProfile) ([]string, hppv1.TLSProtocolVersion) {
 	if profile == nil {
-		profile = &ocpconfigv1.TLSSecurityProfile{
-			Type:         ocpconfigv1.TLSProfileIntermediateType,
-			Intermediate: &ocpconfigv1.IntermediateTLSProfile{},
+		profile = &hppv1.TLSSecurityProfile{
+			Type:         hppv1.TLSProfileIntermediateType,
+			Intermediate: &hppv1.IntermediateTLSProfile{},
 		}
 	}
 
@@ -252,5 +276,5 @@ func selectCipherSuitesAndMinTLSVersion(profile *ocpconfigv1.TLSSecurityProfile)
 		return profile.Custom.TLSProfileSpec.Ciphers, profile.Custom.TLSProfileSpec.MinTLSVersion
 	}
 
-	return ocpconfigv1.TLSProfiles[profile.Type].Ciphers, ocpconfigv1.TLSProfiles[profile.Type].MinTLSVersion
+	return hppv1.TLSProfiles[profile.Type].Ciphers, hppv1.TLSProfiles[profile.Type].MinTLSVersion
 }
